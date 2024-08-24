@@ -2,6 +2,7 @@ import os
 import shutil
 import datetime
 import discord
+import logging
 
 from discord_downloader.config import cfg
 from discord_downloader.parser import base_parser
@@ -11,6 +12,20 @@ from discord_downloader.utils import (
     none_or_date,
     none_or_list,
 )
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class MyClient(discord.Client):
+    async def on_ready(self):
+        logging.info(f'Logged on as {self.user}')
+
+    async def on_message(self, message):
+        if message.author == self.user:
+            return
+
+        if message.content == 'ping':
+            await message.channel.send('pong')
 
 
 def main(
@@ -30,11 +45,6 @@ def main(
     include_str=none_or_str(cfg.get("args", "include_str")),
     exclude_str=none_or_str(cfg.get("args", "exclude_str")),
 ):
-    """Bot to download some files from discord
-
-    See parser help strings for details
-    """
-
     download_dir = "discord_downloads_" + datetime.datetime.now().strftime("%Y%m%d")
     output_dir = os.path.join(output_dir, download_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -54,116 +64,99 @@ def main(
         include_str=include_str,
         exclude_str=exclude_str,
     ):
-        """Wait for client to be ready then do the thing
-
-        Just doing everything inside here because I'm too lazy
-        to deal with async
-        """
-
         if server is None:
-            server = client.guilds[0].name  # Default to first server
+            server = client.guilds[0].name
+        
+        if (after is not None and before is not None) or (num_messages is None or num_messages <= 0):
+            num_messages = None
 
-        if (after is not None and before is not None) or (
-            num_messages is None or num_messages <= 0
-        ):
-            num_messages = None  # Grab all files between dates, no limit
-
-        # Instead of 'None', print 'inf' when searching unlimited messages
         num_str = str(num_messages) if num_messages is not None else "inf"
 
         app_info = await client.application_info()
-        total = 0
+        total = 0 
         for g in client.guilds:
             if g.name == server:
-                print(
-                    f"Connected to {g.name} as {client.user},"
-                    f" emissary of {app_info.owner.name}\n"
-                )
-
+                logging.info(f"Connected to {g.name} as {client.user}, slave of {app_info.owner.name}")
+    
                 text_channels = g.text_channels
                 for c in text_channels:
                     if channels is None or c.name in channels:
                         count = 0
-                        if before is None and after is None:
-                            print(
-                                f"> Looking at last {num_str} messages"
-                                f" in {c.name}..."
-                            )
-                        elif before is not None and after is not None:
-                            print(
-                                f"> Looking at all messages between {before:%Y-%m-%d}"
-                                f" and {after:%Y-%m-%d} in {c.name}..."
-                            )
-                        elif before is not None:
-                            print(
-                                f"> Looking at last {num_str} before"
-                                f" {before:%Y-%m-%d} messages in {c.name}..."
-                            )
-                        elif after is not None:
-                            print(
-                                f"> Looking at first {num_str} after"
-                                f" {after:%Y-%m-%d} messages in {c.name}..."
-                            )
-
-                        async for m in c.history(
-                            limit=num_messages, after=after, before=before
-                        ):
-                            for a in m.attachments:
-                                if (
-                                    (
-                                        filetypes is None
-                                        or a.filename.split(".")[-1] in filetypes
-                                    )
-                                    and (
-                                        include_str is None or include_str in a.filename
-                                    )
-                                    and (
-                                        exclude_str is None
-                                        or exclude_str not in a.filename
-                                    )
-                                ):
-                                    if verbose:
-                                        print(f" > Found {a.filename}")
-                                    count += 1
-                                    fname = (
-                                        m.author.name.replace(" ", "_")
-                                        + "__"
-                                        + a.filename
-                                        if prepend_user
-                                        else a.filename
-                                    )
-                                    fname = os.path.join(output_dir, fname)
-                                    if not dry_run:
-                                        await a.save(fname)
-
-                        print(f" >> Found {count} files.")
+                        logging.info(f"Searching in channel: {c.name}")
+                        
+                        try:
+                            async for m in c.history(limit=num_messages, after=after, before=before):
+                                logging.debug(f"Processing message: {m.id}")
+                                for a in m.attachments:
+                                    logging.debug(f"Found attachment: {a.filename}")
+                                    
+                                    if (filetypes is None or a.filename.split(".")[-1] in filetypes) and \
+                                       (include_str is None or include_str in a.filename) and \
+                                       (exclude_str is None or exclude_str not in a.filename):
+                                        
+                                        star_count = 0
+                                        for r in m.reactions:
+                                            if str(r.emoji) == '⭐':
+                                                star_count = r.count
+                                                break
+                                        logging.debug(f"Attachment {a.filename} has {star_count} star reactions")
+                                        
+                                        if star_count >= 3:
+                                            logging.info(f"Found {a.filename} with {star_count} star reactions")
+                                            count += 1
+                                            fname = m.author.name.replace(" ", "_") + "__" + a.filename if prepend_user else a.filename
+                                            fname = os.path.join(output_dir, fname)
+                                            if not dry_run:
+                                                try:
+                                                    await a.save(fname)
+                                                    logging.info(f"Successfully saved: {fname}")
+                                                except Exception as e:
+                                                    logging.error(f"Failed to save {fname}: {str(e)}")
+                                        else:
+                                            logging.debug(f"Skipped {a.filename} with only {star_count} star reactions")
+                                    else:
+                                        logging.debug(f"Attachment {a.filename} did not meet filter criteria")
+    
+                        except discord.errors.Forbidden:
+                            logging.error(f"No permission to read history in channel: {c.name}")
+                        except Exception as e:
+                            logging.error(f"Error processing channel {c.name}: {str(e)}")
+    
+                        logging.info(f"Found and downloaded {count} files with 3 or more star reactions in {c.name}")
                         total += count
-
-        if dry_run:
-            print(f"\n**** Dry run! 0 of {total} files saved!")
-        else:
-            print(f"\n**** Saved {total} files to {output_dir}")
-        await client.logout()  #
+    
+            if dry_run:
+                logging.info(f"Dry run! 0 of {total} files saved!")
+            else:
+                logging.info(f"Saved {total} files with 3 or more star reactions to {output_dir}")
+        
+        await client.close()
 
     @client.event
     async def on_disconnect(zipped=zipped, dry_run=dry_run, output_dir=output_dir):
-        """Print a logout message to confirm client exits"""
         if zipped and not dry_run:
-            print("  ** Zipping and cleaning files...")
+            logging.info("Zipping and cleaning files...")
             shutil.make_archive(output_dir, "zip", output_dir)
             shutil.rmtree(output_dir)
 
-        print("\nGoodbye world, be excellent to eachother!")
+        logging.info("Disconnected from Discord")
 
-    client.run(token)
+    try:
+        client.run(token)
+    except discord.errors.LoginFailure:
+        logging.error("Failed to log in: Invalid token")
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
 
 
 if __name__ == "__main__":
-
     parser = base_parser
     args = parser.parse_args()
 
-    client = discord.Client()
+    intents = discord.Intents.default()
+    intents.message_content = True
+
+    client = discord.Client(intents=intents)
 
     main(
         client,
